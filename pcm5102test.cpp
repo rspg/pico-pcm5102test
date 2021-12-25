@@ -133,12 +133,12 @@ int main()
     pio_sm_set_enabled(audio_pio, audio_i2s_sm, true);
 
     uint32_t angle = 0;
-    uint32_t frequency = 400;
+    uint32_t frequency = 1000;
     uint32_t step = ((0x8000 << 12)/audio_sample_rate*frequency)>>4; 
     printf("step %d\n", step);
     while (true)
     {
-        int32_t sample = std::max(std::min(fpsin(angle>>8)*6, 0x7FFF), -0x7FFF);
+        int32_t sample = std::max(std::min(fpsin(angle>>8)*4, 0x7FFF), -0x7FFF);
         sample <<= audio_quantize_bits - 16;
         angle += step;
 
