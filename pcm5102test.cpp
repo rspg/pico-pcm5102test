@@ -2,6 +2,7 @@
 #include <algorithm>
 #include "pico/stdlib.h"
 #include "hardware/dma.h"
+#include "hardware/irq.h"
 #include "hardware/pio.h"
 #include "hardware/interp.h"
 #include "hardware/clocks.h"
@@ -16,8 +17,10 @@ constexpr uint PIN_SCK = 3;
 constexpr uint PIN_XSMT = 4;
 
 const PIO& audio_pio = pio0;
-const uint audio_sample_rate = 96000;
+const uint audio_sample_rate = 192000;
 const uint audio_quantize_bits = 24;
+
+int dma_chan = 0;
 
 uint bits()
 {
@@ -101,37 +104,92 @@ int main()
 
     busy_wait_ms(100);
 
-    const pio_program_t* audio_i2s_program = nullptr;
-    void(*audio_i2s_program_init)(PIO pio, uint sm, uint offset, uint data_pin, uint clock_pin_base) = nullptr;
-    switch(audio_quantize_bits)
+    uint audio_i2s_sm = 0;
     {
-        case 24:
-            audio_i2s_program = &audio_i2s_24_program;
-            audio_i2s_program_init = &audio_i2s_24_program_init;
-            break;
-        case 32:
-            audio_i2s_program = &audio_i2s_32_program;
-            audio_i2s_program_init = &audio_i2s_32_program_init;
-            break;
-        default:
-            audio_i2s_program = &audio_i2s_16_program;
-            audio_i2s_program_init = &audio_i2s_16_program_init;
+        const pio_program_t* audio_i2s_program = nullptr;
+        void(*audio_i2s_program_init)(PIO pio, uint sm, uint offset, uint data_pin, uint clock_pin_base) = nullptr;
+        switch(audio_quantize_bits)
+        {
+            case 24:
+                audio_i2s_program = &audio_i2s_24_program;
+                audio_i2s_program_init = &audio_i2s_24_program_init;
+                break;
+            case 32:
+                audio_i2s_program = &audio_i2s_32_program;
+                audio_i2s_program_init = &audio_i2s_32_program_init;
+                break;
+            default:
+                audio_i2s_program = &audio_i2s_16_program;
+                audio_i2s_program_init = &audio_i2s_16_program_init;
+        }
+
+        const uint i2s_offset = pio_add_program(audio_pio, audio_i2s_program);
+        printf("i2s_offset %u\n", i2s_offset);
+        audio_i2s_sm = pio_claim_unused_sm(audio_pio, true);
+        printf("audio_i2s_sm %u\n", audio_i2s_sm);
+        audio_i2s_program_init(audio_pio, audio_i2s_sm, i2s_offset, PIN_DIN, PIN_BCK);
+
+        update_pio_frequency(audio_sample_rate, audio_i2s_sm);
+
+        puts("Hello, world!");
+
+        gpio_put(PIN_XSMT, true);
+        busy_wait_ms(10);
+        pio_sm_set_enabled(audio_pio, audio_i2s_sm, true);
     }
 
-    const uint i2s_offset = pio_add_program(audio_pio, audio_i2s_program);
-    printf("i2s_offset %u\n", i2s_offset);
-    const uint audio_i2s_sm = pio_claim_unused_sm(audio_pio, true);
-    printf("audio_i2s_sm %u\n", audio_i2s_sm);
-    audio_i2s_program_init(audio_pio, audio_i2s_sm, i2s_offset, PIN_DIN, PIN_BCK);
+    {
+        auto dma_handler = +[]() {
+            static bool first = true;
+            static uint32_t waves[audio_sample_rate*2/1000];
 
-    update_pio_frequency(audio_sample_rate, audio_i2s_sm);
+            if(first)
+            {
+                const uint32_t sampleNum = std::size(waves)/2;
+                const uint32_t step = (0x8000<<8)/sampleNum;
+                for(uint32_t i = 0; i < sampleNum; ++i)
+                {
+                    auto sample = (int32_t)fpsin(i*step>>8)*4;
+                    sample <<= audio_quantize_bits - 16;
 
-    puts("Hello, world!");
+                    waves[i*2 + 0] = waves[i*2 + 1] = sample << (32 - audio_quantize_bits);
+                    printf("%u %d\n", i*step>>8, sample);
+                }
+                first = false;
+            }
 
-    gpio_put(PIN_XSMT, true);
-    busy_wait_ms(10);
-    pio_sm_set_enabled(audio_pio, audio_i2s_sm, true);
+            dma_hw->ints0 = 1u << dma_chan;
+            dma_channel_set_trans_count(dma_chan, std::size(waves), false);
+            dma_channel_set_read_addr(dma_chan, waves, true);
+        };
 
+        // Configure a channel to write the same word (32 bits) repeatedly to PIO0
+        // SM0's TX FIFO, paced by the data request signal from that peripheral.
+        dma_chan = dma_claim_unused_channel(true);
+        dma_channel_config config = dma_channel_get_default_config(dma_chan);
+        channel_config_set_transfer_data_size(&config, DMA_SIZE_32);
+        channel_config_set_read_increment(&config, true);
+        channel_config_set_dreq(&config, DREQ_PIO0_TX0);
+        dma_channel_configure(
+            dma_chan,
+            &config,
+            &pio0_hw->txf[audio_i2s_sm], // Write address (only need to set this once)
+            nullptr,             // Don't provide a read address yet
+            0,                  // Write the same value many times, then halt and interrupt
+            false             // Don't start yet
+        );
+
+        // Tell the DMA to raise IRQ line 0 when the channel finishes a block
+        dma_channel_set_irq0_enabled(dma_chan, true);
+
+        // Configure the processor to run dma_handler() when DMA IRQ 0 is asserted
+        irq_set_exclusive_handler(DMA_IRQ_0, dma_handler);
+        irq_set_enabled(DMA_IRQ_0, true);
+
+        dma_handler();
+    }
+
+#if 0
     uint32_t angle = 0;
     uint32_t frequency = 1000;
     uint32_t step = ((0x8000 << 12)/audio_sample_rate*frequency)>>4; 
@@ -146,6 +204,10 @@ int main()
         pio_sm_put_blocking (audio_pio, audio_i2s_sm, sample_32);
         pio_sm_put_blocking (audio_pio, audio_i2s_sm, sample_32);
     }
+#endif
+
+    while(true)
+        tight_loop_contents();
 
     return 0;
 }
