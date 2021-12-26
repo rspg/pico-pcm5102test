@@ -1,4 +1,6 @@
 #include <stdio.h>
+#include <unistd.h>
+#include <sys/select.h>
 #include <algorithm>
 #include "pico/stdlib.h"
 #include "hardware/dma.h"
@@ -9,6 +11,7 @@
 #include "audio_i2s_16.pio.h"
 #include "audio_i2s_24.pio.h"
 #include "audio_i2s_32.pio.h"
+#include "libhelix-mp3/pub/mp3common.h"
 
 constexpr uint PIN_BCK = 0;
 constexpr uint PIN_LRCK = 1;
@@ -87,11 +90,107 @@ int16_t fpsin(int16_t i)
     return c ? -y : y;
 }
 
+int read_data(uint8_t* buf, int size)
+{
+    int c = getchar_timeout_us(1000);
+    if(c == PICO_ERROR_TIMEOUT)
+        return -1;
+    
+    buf[0] = c;
+    for(int i = 1; i < size; ++i)
+    {
+        c = getchar_timeout_us(0);
+        if(c == PICO_ERROR_TIMEOUT)
+            return i;
+        buf[i] = c;
+    }
+    return size;
+}
+
 int main()
 {
     stdio_init_all();
 
     busy_wait_ms(1000);
+
+    while(true)
+    {
+        auto mp3dec = MP3InitDecoder();
+        MP3FrameInfo frameinfo;
+        const uint32_t recvbuf_size = 4096;
+        uint8_t recvbuf[recvbuf_size];
+        uint8_t* recvbuf_write_ptr = recvbuf;
+        uint8_t* recvbuf_read_ptr = recvbuf;
+        short outbuf[MAX_NCHAN * MAX_NGRAN * MAX_NSAMP];
+        bool receive_completed = false;
+
+        while(true)
+        {
+            auto databytes = recvbuf_write_ptr - recvbuf_read_ptr;
+            auto writespace = recvbuf_size - (recvbuf_write_ptr - recvbuf);
+            if(recvbuf_read_ptr != recvbuf && writespace < recvbuf_size/4)
+            {
+                printf("move to top\n");
+                std::move(recvbuf_read_ptr, recvbuf_write_ptr, recvbuf);
+                recvbuf_read_ptr = recvbuf;
+                recvbuf_write_ptr = recvbuf + databytes;
+                writespace = recvbuf_size - databytes;
+            }
+            auto bytes = read_data(recvbuf_write_ptr, writespace);
+            if(bytes > 0)
+            {
+                recvbuf_write_ptr += bytes;
+                //printf("read %u bytes\n", bytes);
+            }
+
+            if(databytes > 0)
+            {
+                auto offset = MP3FindSyncWord(recvbuf_read_ptr, databytes);
+                if(offset < 0)
+                    continue;
+                
+                printf("MP3FindSyncWord %u\n", offset);
+                recvbuf_read_ptr += offset;
+                databytes -= offset;
+
+                printf("MP3Decode %u\n", databytes);
+                auto err = MP3Decode(mp3dec, &recvbuf_read_ptr, &databytes, outbuf, 0);
+                if (err) {
+                    bool outofdata = false;
+                    printf("err %d\n", err);
+                    switch (err) {
+                        case ERR_MP3_INDATA_UNDERFLOW:
+                            outofdata = true;
+                            break;
+                        case ERR_MP3_MAINDATA_UNDERFLOW:
+                            /* do nothing - next call to decode will provide more mainData */
+                            break;
+                        case ERR_MP3_FREE_BITRATE_SYNC:
+                        default:
+                            outofdata = true;
+                            break;
+                    }
+                    if(outofdata)
+                        continue;
+                }
+                else
+                {
+                    MP3GetLastFrameInfo(mp3dec, &frameinfo);
+                    printf("MP3GetLastFrameInfo\n");
+                }
+            
+            }
+        }
+
+        printf("finished\n");
+
+        MP3FreeDecoder(mp3dec);
+    }
+
+    while(true)
+        tight_loop_contents();
+
+
 
     const uint pinMask = bits(PIN_XSMT, PIN_SCK, PIN_BCK, PIN_DIN, PIN_LRCK);
     gpio_init_mask(pinMask);

@@ -41,5 +41,8 @@ target_link_libraries(pcm5102test
         hardware_interp
         )
 
+add_subdirectory("${PROJECT_SOURCE_DIR}/libhelix-mp3")
+target_link_libraries(pcm5102test libhelix-mp3)
+
 pico_add_extra_outputs(pcm5102test)
 
