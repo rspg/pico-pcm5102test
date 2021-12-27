@@ -20,10 +20,48 @@ constexpr uint PIN_SCK = 3;
 constexpr uint PIN_XSMT = 4;
 
 const PIO& audio_pio = pio0;
-const uint audio_sample_rate = 192000;
-const uint audio_quantize_bits = 24;
+const uint audio_sample_rate = 44100;
+const uint audio_quantize_bits = 16;
+
+struct audio_send_buffer_t
+{
+    uint32_t samples[MAX_NCHAN * MAX_NGRAN * MAX_NSAMP];
+    int      count = 0;
+    audio_send_buffer_t* next = nullptr;
+};
+audio_send_buffer_t audio_send_buffer[2];
+audio_send_buffer_t audio_send_buffer_silent;
+audio_send_buffer_t* audio_send_buffer_request = nullptr;
+audio_send_buffer_t* audio_send_buffer_free = nullptr;
+
+audio_send_buffer_t* pull_audio_buffer(audio_send_buffer_t*& head)
+{
+    if(head == nullptr)
+        return nullptr;
+
+    auto buffer = head;
+    head = head->next;
+    buffer->next = nullptr;
+
+    return buffer;
+}
+void push_audio_buffer(audio_send_buffer_t*& head, audio_send_buffer_t* next)
+{
+    auto top = head;
+    while(top != nullptr && top->next != nullptr)
+        top = top->next;
+    if(top)
+        top->next = next;
+    else
+        head = next;
+}
 
 int dma_chan = 0;
+
+const uint32_t recvbuf_size = 4096;
+uint8_t recvbuf[recvbuf_size];
+short outbuf[MAX_NCHAN * MAX_NGRAN * MAX_NSAMP];
+
 
 uint bits()
 {
@@ -107,91 +145,34 @@ int read_data(uint8_t* buf, int size)
     return size;
 }
 
-int main()
+void dma_handler()
 {
-    stdio_init_all();
-
-    busy_wait_ms(1000);
-
-    while(true)
+    static audio_send_buffer_t* sending_buffer = nullptr;
+    
+    if(sending_buffer != nullptr)
+    {  
+        push_audio_buffer(audio_send_buffer_free, sending_buffer);
+        sending_buffer = nullptr;
+    }
+    auto request = pull_audio_buffer(audio_send_buffer_request); 
+    if(request != nullptr)
     {
-        auto mp3dec = MP3InitDecoder();
-        MP3FrameInfo frameinfo;
-        const uint32_t recvbuf_size = 4096;
-        uint8_t recvbuf[recvbuf_size];
-        uint8_t* recvbuf_write_ptr = recvbuf;
-        uint8_t* recvbuf_read_ptr = recvbuf;
-        short outbuf[MAX_NCHAN * MAX_NGRAN * MAX_NSAMP];
-        bool receive_completed = false;
-
-        while(true)
-        {
-            auto databytes = recvbuf_write_ptr - recvbuf_read_ptr;
-            auto writespace = recvbuf_size - (recvbuf_write_ptr - recvbuf);
-            if(recvbuf_read_ptr != recvbuf && writespace < recvbuf_size/4)
-            {
-                printf("move to top\n");
-                std::move(recvbuf_read_ptr, recvbuf_write_ptr, recvbuf);
-                recvbuf_read_ptr = recvbuf;
-                recvbuf_write_ptr = recvbuf + databytes;
-                writespace = recvbuf_size - databytes;
-            }
-            auto bytes = read_data(recvbuf_write_ptr, writespace);
-            if(bytes > 0)
-            {
-                recvbuf_write_ptr += bytes;
-                //printf("read %u bytes\n", bytes);
-            }
-
-            if(databytes > 0)
-            {
-                auto offset = MP3FindSyncWord(recvbuf_read_ptr, databytes);
-                if(offset < 0)
-                    continue;
-                
-                printf("MP3FindSyncWord %u\n", offset);
-                recvbuf_read_ptr += offset;
-                databytes -= offset;
-
-                printf("MP3Decode %u\n", databytes);
-                auto err = MP3Decode(mp3dec, &recvbuf_read_ptr, &databytes, outbuf, 0);
-                if (err) {
-                    bool outofdata = false;
-                    printf("err %d\n", err);
-                    switch (err) {
-                        case ERR_MP3_INDATA_UNDERFLOW:
-                            outofdata = true;
-                            break;
-                        case ERR_MP3_MAINDATA_UNDERFLOW:
-                            /* do nothing - next call to decode will provide more mainData */
-                            break;
-                        case ERR_MP3_FREE_BITRATE_SYNC:
-                        default:
-                            outofdata = true;
-                            break;
-                    }
-                    if(outofdata)
-                        continue;
-                }
-                else
-                {
-                    MP3GetLastFrameInfo(mp3dec, &frameinfo);
-                    printf("MP3GetLastFrameInfo\n");
-                }
-            
-            }
-        }
-
-        printf("finished\n");
-
-        MP3FreeDecoder(mp3dec);
+        sending_buffer = request;
+    }
+    else
+    {
+        request = &audio_send_buffer_silent;
     }
 
-    while(true)
-        tight_loop_contents();
+    dma_hw->ints0 = 1u << dma_chan;
 
+    dma_channel_set_trans_count(dma_chan, 2304, false);
+    dma_channel_set_read_addr(dma_chan, request->samples, false);
+    dma_channel_start(dma_chan);
+}
 
-
+void init()
+{
     const uint pinMask = bits(PIN_XSMT, PIN_SCK, PIN_BCK, PIN_DIN, PIN_LRCK);
     gpio_init_mask(pinMask);
     gpio_set_dir_out_masked(pinMask);
@@ -237,73 +218,165 @@ int main()
         pio_sm_set_enabled(audio_pio, audio_i2s_sm, true);
     }
 
+    for(int i = 0; i < std::size(audio_send_buffer) - 1; ++i)
+        audio_send_buffer[i].next = &audio_send_buffer[i + 1];
+    audio_send_buffer_free = &audio_send_buffer[0];
+    audio_send_buffer_request = nullptr;
+    
+    // Configure a channel to write the same word (32 bits) repeatedly to PIO0
+    // SM0's TX FIFO, paced by the data request signal from that peripheral.
+    dma_chan = dma_claim_unused_channel(true);
+    dma_channel_config config = dma_channel_get_default_config(dma_chan);
+    channel_config_set_transfer_data_size(&config, DMA_SIZE_32);
+    channel_config_set_read_increment(&config, true);
+    channel_config_set_dreq(&config, DREQ_PIO0_TX0);
+    dma_channel_configure(
+        dma_chan,
+        &config,
+        &pio0_hw->txf[audio_i2s_sm], // Write address (only need to set this once)
+        nullptr,             // Don't provide a read address yet
+        0,                  // Write the same value many times, then halt and interrupt
+        false             // Don't start yet
+    );
+
+    // Tell the DMA to raise IRQ line 0 when the channel finishes a block
+    dma_channel_set_irq0_enabled(dma_chan, true);
+
+    // Configure the processor to run dma_handler() when DMA IRQ 0 is asserted
+    irq_set_exclusive_handler(DMA_IRQ_0, dma_handler);
+    irq_set_enabled(DMA_IRQ_0, true);
+
+    puts("kick dma");
+    dma_handler();
+}
+
+void acceptMP3()
+{
+    while(true)
     {
-        auto dma_handler = +[]() {
-            static bool first = true;
-            static uint32_t waves[audio_sample_rate*2/1000];
+        printf("Ready\n");
 
-            if(first)
+        auto mp3dec = MP3InitDecoder();
+        MP3FrameInfo frameinfo;
+        uint8_t* recvbuf_write_ptr = recvbuf;
+        uint8_t* recvbuf_read_ptr = recvbuf;
+        
+        bool receive_completed = false;
+
+        auto receive = [&](bool blocking)
+        {
+            auto databytes = recvbuf_write_ptr - recvbuf_read_ptr;
+            auto writespace = recvbuf_size - (recvbuf_write_ptr - recvbuf);
+            if(recvbuf_read_ptr != recvbuf && writespace < recvbuf_size/4)
             {
-                const uint32_t sampleNum = std::size(waves)/2;
-                const uint32_t step = (0x8000<<8)/sampleNum;
-                for(uint32_t i = 0; i < sampleNum; ++i)
-                {
-                    auto sample = (int32_t)fpsin(i*step>>8)*4;
-                    sample <<= audio_quantize_bits - 16;
-
-                    waves[i*2 + 0] = waves[i*2 + 1] = sample << (32 - audio_quantize_bits);
-                    printf("%u %d\n", i*step>>8, sample);
-                }
-                first = false;
+                //printf("move to top\n");
+                std::move(recvbuf_read_ptr, recvbuf_write_ptr, recvbuf);
+                recvbuf_read_ptr = recvbuf;
+                recvbuf_write_ptr = recvbuf + databytes;
+                writespace = recvbuf_size - databytes;
             }
-
-            dma_hw->ints0 = 1u << dma_chan;
-            dma_channel_set_trans_count(dma_chan, std::size(waves), false);
-            dma_channel_set_read_addr(dma_chan, waves, true);
+            int bytes = 0;
+            do{
+                bytes = read_data(recvbuf_write_ptr, writespace);
+            }while(bytes == -1 && blocking);
+            if(bytes > 0)
+            {
+                recvbuf_write_ptr += bytes;
+                databytes = recvbuf_write_ptr - recvbuf_read_ptr;
+                //printf("read %u bytes\n", bytes);
+            }
+            return databytes;
         };
 
-        // Configure a channel to write the same word (32 bits) repeatedly to PIO0
-        // SM0's TX FIFO, paced by the data request signal from that peripheral.
-        dma_chan = dma_claim_unused_channel(true);
-        dma_channel_config config = dma_channel_get_default_config(dma_chan);
-        channel_config_set_transfer_data_size(&config, DMA_SIZE_32);
-        channel_config_set_read_increment(&config, true);
-        channel_config_set_dreq(&config, DREQ_PIO0_TX0);
-        dma_channel_configure(
-            dma_chan,
-            &config,
-            &pio0_hw->txf[audio_i2s_sm], // Write address (only need to set this once)
-            nullptr,             // Don't provide a read address yet
-            0,                  // Write the same value many times, then halt and interrupt
-            false             // Don't start yet
-        );
+        bool datacompleted = false;
+        while(true)
+        {
+            printf("loop\n");
+            
+            int databytes = receive(true);
 
-        // Tell the DMA to raise IRQ line 0 when the channel finishes a block
-        dma_channel_set_irq0_enabled(dma_chan, true);
+            int offset = -1;
+            while(offset < 0)
+            {
+                offset = MP3FindSyncWord(recvbuf_read_ptr, databytes);
+                if(offset < 0)
+                    databytes = receive(true);
+            }
+            
+            //printf("MP3FindSyncWord %u\n", offset);
+            recvbuf_read_ptr += offset;
+            databytes -= offset;
 
-        // Configure the processor to run dma_handler() when DMA IRQ 0 is asserted
-        irq_set_exclusive_handler(DMA_IRQ_0, dma_handler);
-        irq_set_enabled(DMA_IRQ_0, true);
+            bool nextframe = false;
+            while(!nextframe)
+            {
+                //printf("MP3Decode %u\n", databytes);
 
-        dma_handler();
+                auto inbuf = recvbuf_read_ptr;
+                auto bytesLeft = databytes;
+                auto err = MP3Decode(mp3dec, &inbuf, &bytesLeft, outbuf, 0);
+                if (err) {
+                    //printf("err %d\n", err);
+                    bool outofdata = false;
+                    switch (err) {
+                        case ERR_MP3_INDATA_UNDERFLOW:
+                            outofdata = true;
+                            break;
+                        case ERR_MP3_MAINDATA_UNDERFLOW:
+                            /* do nothing - next call to decode will provide more mainData */
+                            break;
+                        case ERR_MP3_FREE_BITRATE_SYNC:
+                        default:
+                            outofdata = true;
+                            break;
+                    }
+                    databytes = receive(true);
+                }
+                else
+                {
+                    recvbuf_read_ptr = inbuf;
+                    databytes = bytesLeft;
+
+                    MP3GetLastFrameInfo(mp3dec, &frameinfo);
+
+                    audio_send_buffer_t* buffer = nullptr;
+                    do{
+                        buffer = pull_audio_buffer(audio_send_buffer_free);
+                        databytes = receive(false);
+                    }while(buffer == nullptr);
+                    
+                    for(size_t i = 0; i < std::size(outbuf); ++i){
+                        buffer->samples[i] = outbuf[i]<<18;
+                        // printf("%04x ", std::abs(outbuf[i]));
+                        // if(i%16==0)
+                        //     printf("\n");
+                    }
+                    //printf("\n");
+                    buffer->count = frameinfo.outputSamps;
+
+                    push_audio_buffer(audio_send_buffer_request, buffer);
+
+                    //printf("MP3GetLastFrameInfo %d %d\n", frameinfo.bitsPerSample, frameinfo.outputSamps);
+                    nextframe = true;
+                }
+            }
+        }
+
+        printf("finished\n");
+
+        MP3FreeDecoder(mp3dec);
     }
+}
 
-#if 0
-    uint32_t angle = 0;
-    uint32_t frequency = 1000;
-    uint32_t step = ((0x8000 << 12)/audio_sample_rate*frequency)>>4; 
-    printf("step %d\n", step);
-    while (true)
-    {
-        int32_t sample = std::max(std::min(fpsin(angle>>8)*4, 0x7FFF), -0x7FFF);
-        sample <<= audio_quantize_bits - 16;
-        angle += step;
+int main()
+{
+    stdio_init_all();
 
-        uint32_t sample_32 = sample << (32 - audio_quantize_bits);
-        pio_sm_put_blocking (audio_pio, audio_i2s_sm, sample_32);
-        pio_sm_put_blocking (audio_pio, audio_i2s_sm, sample_32);
-    }
-#endif
+    busy_wait_ms(1000);
+
+    init();
+
+    acceptMP3();
 
     while(true)
         tight_loop_contents();

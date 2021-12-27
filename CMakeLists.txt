@@ -39,6 +39,7 @@ target_link_libraries(pcm5102test
         hardware_dma
         hardware_pio
         hardware_interp
+        pico_multicore
         )
 
 add_subdirectory("${PROJECT_SOURCE_DIR}/libhelix-mp3")
