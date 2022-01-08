@@ -8,13 +8,13 @@
       "name": "Cortex Debug",
       "cwd": "${workspaceRoot}",
       "executable": "${command:cmake.launchTargetPath}",
-      "request": "launch",
+      "request": "attach",
       "type": "cortex-debug",
       "servertype": "openocd",
-      "gdbPath": "gdb-multiarch",
+      "gdbPath": "C:\\msys64\\mingw64\\bin\\gdb-multiarch.exe",
       "device": "RP2040",
       "configFiles": [
-        "interface/raspberrypi-swd.cfg",
+        "interface/nanoprobe.cfg",
         "target/rp2040.cfg"
         ],
       "svdFile": "${env:PICO_SDK_PATH}/src/rp2040/hardware_regs/rp2040.svd",

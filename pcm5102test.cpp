@@ -7,6 +7,7 @@
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
 #include "pico/sync.h"
+#include "pico/time.h"
 #include "hardware/dma.h"
 #include "hardware/irq.h"
 #include "hardware/pio.h"
@@ -271,7 +272,7 @@ void core1_loop()
         const uint32_t write_pos_raw = usb_recv_buf_write_pos;
         critical_section_exit(&usb_recv_cs);
         
-        assert(read_pos_raw < write_pos_raw);
+        assert(read_pos_raw <= write_pos_raw);
 
         if(write_pos_raw - read_pos_raw < usb_recv_buf_size)
         {
@@ -311,7 +312,7 @@ uint32_t fetch_usb_tx_data(uint8_t* buf, uint32_t size)
     const uint32_t write_pos_raw = usb_recv_buf_write_pos;
     critical_section_exit(&usb_recv_cs);
 
-    assert(read_pos_raw < write_pos_raw);
+    assert(read_pos_raw <= write_pos_raw);
 
     if(read_pos_raw >= write_pos_raw)
         return 0;
@@ -480,7 +481,7 @@ void acceptMP3()
                     }while(buffer == nullptr);
                     
                     for(size_t i = 0; i < std::size(outbuf); ++i){
-                        buffer->samples[i] = outbuf[i]<<16;
+                        buffer->samples[i] = outbuf[i]<<14;
                         // printf("%04x ", std::abs(outbuf[i]));
                         // if(i%16==0)
                         //     printf("\n");
@@ -503,6 +504,8 @@ void acceptMP3()
 
 int main()
 {
+    //set_sys_clock_khz(200000, true);
+
     stdio_init_all();
 
     busy_wait_ms(1000);
@@ -515,6 +518,11 @@ int main()
         tight_loop_contents();
 
     return 0;
+}
+
+extern "C" long systime_get()
+{
+    return to_ms_since_boot(get_absolute_time());
 }
 
 #if 0
